@@ -23,6 +23,11 @@ const mainKeyboard = {
     }
 };
 
+// Strip everything except digits
+function cleanNumber(raw) {
+    return raw.replace(/\D/g, '');
+}
+
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard.', mainKeyboard);
 });
@@ -39,17 +44,14 @@ bot.on('message', async (msg) => {
     }
 
     if (text === '📂 Send number list') {
-        if (!isConnected) {
-            bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
-        } else {
-            bot.sendMessage(chatId, '📄 Send a .txt file with one number per line.');
-        }
+        if (!isConnected) bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
+        else bot.sendMessage(chatId, '📄 Send a .txt file with one number per line.');
         return;
     }
 
     if (expectingNumberForPair) {
         expectingNumberForPair = false;
-        const phoneNumber = text.trim().replace(/\D/g, '');
+        const phoneNumber = cleanNumber(text);
         if (phoneNumber.length < 10) {
             bot.sendMessage(chatId, '❌ Invalid number. Try again.');
             expectingNumberForPair = true;
@@ -57,12 +59,12 @@ bot.on('message', async (msg) => {
         }
 
         pairingChatId = chatId;
-        bot.sendMessage(chatId, '⏳ Requesting pairing code from WhatsApp...');
-        connectWhatsApp(chatId);
+        bot.sendMessage(chatId, '⏳ Requesting real pairing code from WhatsApp...');
+        connectWhatsApp(chatId, phoneNumber);
     }
 });
 
-async function connectWhatsApp(chatId) {
+async function connectWhatsApp(chatId, phoneNumber) {
     if (sock) { try { sock.end(); } catch(e) {} sock = null; }
 
     const { state, saveCreds } = await useMultiFileAuthState('./session');
@@ -70,38 +72,33 @@ async function connectWhatsApp(chatId) {
         auth: state,
         browser: ['TelegramBot', 'Chrome', '1.0.0'],
         printQRInTerminal: false,
-        pairingCode: true      // Native pairing code mode (valid for 7.0.0-rc.9)
+        // pairingCode: true   // we'll request manually, no need
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // --- Dedicated pairing code event (the real code arrives here) ---
-    sock.ev.on('pairingCode', async ({ code }) => {
-        console.log('Pairing code received:', code);
-        if (!pairingChatId) return;
-        const display = code.slice(0,4) + '-' + code.slice(4);
-        await bot.sendMessage(
-            pairingChatId,
-            `🔐 *Real linking code ready*\n\n\`${display}\`\n\n(Type \`${code}\` on the target phone → Linked Devices → Link a Device)`,
-            { parse_mode: 'Markdown' }
-        );
-        // Do NOT clear pairingChatId here; it will be cleared on connection open
-    });
-
-    // --- Connection update (backup and state management) ---
+    // When the socket is ready (QR received), request a pairing code with the phone number
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+        console.log('Connection state:', connection, qr ? 'QR ready' : '');
 
-        // Fallback: some versions emit pairing code inside connection.update as well
-        if (update.pairingCode && pairingChatId) {
-            console.log('Pairing code from connection.update:', update.pairingCode);
-            const code = update.pairingCode;
-            const display = code.slice(0,4) + '-' + code.slice(4);
-            await bot.sendMessage(
-                pairingChatId,
-                `🔐 *Real linking code ready*\n\n\`${display}\`\n\n(Type \`${code}\` on the target phone → Linked Devices → Link a Device)`,
-                { parse_mode: 'Markdown' }
-            );
+        if (qr && pairingChatId) {
+            // Socket is ready for pairing code request
+            try {
+                console.log('Requesting pairing code for:', phoneNumber);
+                const code = await sock.requestPairingCode(phoneNumber);
+                console.log('Received real code:', code);
+                const display = code.slice(0,4) + '-' + code.slice(4);
+                bot.sendMessage(
+                    pairingChatId,
+                    `🔐 *Real linking code is ready*\n\n\`${display}\`\n\n(Type \`${code}\` without dash on that phone:\nWhatsApp → Linked Devices → Link a Device)`,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (err) {
+                console.error('requestPairingCode error:', err);
+                bot.sendMessage(pairingChatId, '❌ Failed to get pairing code. Try again or check logs.');
+                pairingChatId = null;
+            }
             return;
         }
 
@@ -125,13 +122,24 @@ async function connectWhatsApp(chatId) {
                 }
                 return;
             }
-            // Reconnect silently after 5s
-            setTimeout(() => connectWhatsApp(chatId), 5000);
+            setTimeout(() => connectWhatsApp(chatId, phoneNumber), 5000);
         }
+    });
+
+    // Optional: dedicated event for pairing code (some versions)
+    sock.ev.on('pairingCode', async ({ code }) => {
+        console.log('Pairing code event:', code);
+        if (!pairingChatId) return;
+        const display = code.slice(0,4) + '-' + code.slice(4);
+        await bot.sendMessage(
+            pairingChatId,
+            `🔐 *Real linking code ready*\n\n\`${display}\`\n\n(Type \`${code}\` on the target phone → Linked Devices → Link a Device)`,
+            { parse_mode: 'Markdown' }
+        );
     });
 }
 
-// --- File check (unchanged) ---
+// --- file check (unchanged) ---
 bot.on('document', async (msg) => {
     if (msg.from.id !== MASTER_ID) return;
     if (!isConnected || !sock?.user) {
@@ -145,7 +153,7 @@ bot.on('document', async (msg) => {
 
     const results = [];
     for (let raw of numbers) {
-        const clean = raw.replace(/\D/g, '');
+        const clean = cleanNumber(raw);
         if (!clean) continue;
         const jid = clean + '@s.whatsapp.net';
         try {
@@ -164,4 +172,4 @@ bot.on('document', async (msg) => {
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot started with pairing code listener');
+console.log('Bot started with explicit code request');
