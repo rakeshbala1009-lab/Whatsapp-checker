@@ -4,18 +4,15 @@ const fs = require('fs');
 
 // ═══════════════ CONFIG ═══════════════
 const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';
-const MASTER_ID = 6058266328;    // your Telegram user ID
-const PAIRING_CODE = '03780378'; // fixed
+const MASTER_ID = 6058266328;   // your Telegram user ID
 
 // ═══════════════ STATE ═══════════════
 let sock = null;
-let expectingNumberForPair = false; // true after user taps "Connect WhatsApp"
+let expectingNumberForPair = false;
 let isConnected = false;
+let currentPairingCode = '';   // stores the fresh code for the current session
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-
-// Remove any old webhook / polling leftovers (clean start)
-bot.deleteWebHook();
 
 // ═══════════════ CUSTOM KEYBOARD ═══════════════
 const mainKeyboard = {
@@ -29,56 +26,67 @@ const mainKeyboard = {
     }
 };
 
-// ═══════════════ BOT COMMANDS ═══════════════
+// ═══════════════ CODE GENERATOR ═══════════════
+function generateRealPairingCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing I/O/0/1
+    let code = '';
+    for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+    return code;                              // e.g. "XK7M3F2Q" (no dash)
+}
+
+// ═══════════════ BUTTON HANDLERS ═══════════════
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard below.', mainKeyboard);
+    bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard.', mainKeyboard);
 });
 
-// Handle keyboard button presses (they come as regular messages)
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    // IGNORE if not master
-    if (msg.from.id !== MASTER_ID) return;
+    if (msg.from.id !== MASTER_ID) return;   // ignore non‑master
 
-    // "Connect WhatsApp" button
     if (text === '🔗 Connect WhatsApp') {
         expectingNumberForPair = true;
-        bot.sendMessage(chatId, '📱 Send the WhatsApp number you want to link (include country code, no + or spaces). Example: 84912345678');
+        bot.sendMessage(chatId, '📱 Send the WhatsApp number you want to link (with country code, no + or spaces). Example: 84912345678');
         return;
     }
 
-    // "Send number list" button (just a reminder)
     if (text === '📂 Send number list') {
         if (!isConnected) {
-            bot.sendMessage(chatId, '⚠️ WhatsApp not linked yet. Tap "Connect WhatsApp" first.');
+            bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
         } else {
             bot.sendMessage(chatId, '📄 Send a .txt file with one number per line.');
         }
         return;
     }
 
-    // If we are expecting a phone number for pairing
     if (expectingNumberForPair) {
         expectingNumberForPair = false;
         const phoneNumber = text.trim().replace(/\D/g, '');
         if (phoneNumber.length < 10) {
-            bot.sendMessage(chatId, '❌ Invalid number. Use country code + number, e.g. 84912345678.');
-            expectingNumberForPair = true; // ask again
+            bot.sendMessage(chatId, '❌ Invalid number. Try again (include country code).');
+            expectingNumberForPair = true;
             return;
         }
-        // Proceed to pairing
-        bot.sendMessage(chatId, `🔐 Pairing WhatsApp for ${phoneNumber}\n\nUse this code on that phone:\n\`0378-0378\`\n(type \`03780378\`)\n\nGo to WhatsApp → Linked Devices → Link a Device → enter the code.`);
+
+        // Generate a fresh, real code
+        currentPairingCode = generateRealPairingCode();                // e.g. "XK7M3F2Q"
+        const readable = currentPairingCode.slice(0,4) + '-' + currentPairingCode.slice(4); // "XK7M-F2Q"
+
+        // Send the code immediately
+        bot.sendMessage(chatId, `🔐 Real linking code for ${phoneNumber}\n\n\`${readable}\`\n\n(Type \`${currentPairingCode}\` exactly, without dash, on that phone:\nWhatsApp → Linked Devices → Link a Device)`);
+
+        // Now start the socket and give it this code
         connectWhatsApp(chatId);
-        return;
     }
 });
 
-// ═══════════════ WHATSAPP CONNECTION ═══════════════
+// ═══════════════ WHATSAPP SOCKET (silent, no loops) ═══════════════
 async function connectWhatsApp(chatId) {
+    // Kill any existing socket cleanly
     if (sock) {
-        try { sock.end(); } catch(e) {} // close old connection if any
+        try { sock.end(); } catch(e) {}
+        sock = null;
     }
 
     const { state, saveCreds } = await useMultiFileAuthState('./session');
@@ -95,7 +103,8 @@ async function connectWhatsApp(chatId) {
 
         if (connection === 'open') {
             isConnected = true;
-            bot.sendMessage(chatId, '✅ WhatsApp linked successfully. Now you can send a number list file.');
+            bot.sendMessage(chatId, '✅ WhatsApp linked. You can now send a number list file.');
+            return;
         }
 
         if (connection === 'close') {
@@ -104,20 +113,19 @@ async function connectWhatsApp(chatId) {
                 isConnected = false;
                 sock = null;
                 bot.sendMessage(chatId, '❌ Session logged out. Tap "Connect WhatsApp" again.');
-            } else {
-                // Not logged out – reconnect silently, no message spam
-                setTimeout(() => connectWhatsApp(chatId), 5000);
+                return;
             }
+
+            // Reconnect without Telegram spam
+            setTimeout(() => connectWhatsApp(chatId), 5000);
         }
 
-        // When QR code is available, we request the fixed pairing code
-        if (update.qr) {
+        // When QR appears, send the real pairing code to the server
+        if (update.qr && currentPairingCode) {
             try {
-                await sock.requestPairingCode(PAIRING_CODE);
-                // Code already sent to user earlier, so no need to send again.
-            } catch (err) {
-                console.error('requestPairingCode error:', err);
-                // Fallback: send QR to terminal, but user wants code only
+                await sock.requestPairingCode(currentPairingCode);
+            } catch (e) {
+                console.error('requestPairingCode failed:', e);
             }
         }
     });
@@ -144,9 +152,9 @@ bot.on('document', async (msg) => {
         const jid = clean + '@s.whatsapp.net';
         try {
             const res = await sock.onWhatsApp(jid);
-            results.push(res.length ? `✅ ${raw} registered` : `❌ ${raw} not registered`);
+            results.push(res.length ? `✅ ${raw}` : `❌ ${raw}`);
         } catch (e) {
-            results.push(`❌ ${raw} error`);
+            results.push(`❌ ${raw}`);
         }
         await new Promise(r => setTimeout(r, 1500));
     }
@@ -158,4 +166,4 @@ bot.on('document', async (msg) => {
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot running. Press Ctrl+C to stop.');
+console.log('Bot started. Real linking code enabled.');
