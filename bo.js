@@ -8,11 +8,10 @@ const MASTER_ID = 6058266328;
 let sock = null;
 let expectingNumberForPair = false;
 let isConnected = false;
-let pairingChatId = null;               // where to send the code when ready
+let pairingChatId = null;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// keyboard
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
@@ -58,13 +57,12 @@ bot.on('message', async (msg) => {
         }
 
         pairingChatId = chatId;
-        bot.sendMessage(chatId, '⏳ Requesting a real pairing code from WhatsApp...');
+        bot.sendMessage(chatId, '⏳ Requesting pairing code from WhatsApp...');
         connectWhatsApp(chatId);
     }
 });
 
 async function connectWhatsApp(chatId) {
-    // Clean up any old session socket
     if (sock) { try { sock.end(); } catch(e) {} sock = null; }
 
     const { state, saveCreds } = await useMultiFileAuthState('./session');
@@ -72,27 +70,41 @@ async function connectWhatsApp(chatId) {
         auth: state,
         browser: ['TelegramBot', 'Chrome', '1.0.0'],
         printQRInTerminal: false,
-        pairingCode: true          // <--- native pairing code mode (v7+)
+        pairingCode: true      // Native pairing code mode (valid for 7.0.0-rc.9)
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // --- Dedicated pairing code event (the real code arrives here) ---
+    sock.ev.on('pairingCode', async ({ code }) => {
+        console.log('Pairing code received:', code);
+        if (!pairingChatId) return;
+        const display = code.slice(0,4) + '-' + code.slice(4);
+        await bot.sendMessage(
+            pairingChatId,
+            `🔐 *Real linking code ready*\n\n\`${display}\`\n\n(Type \`${code}\` on the target phone → Linked Devices → Link a Device)`,
+            { parse_mode: 'Markdown' }
+        );
+        // Do NOT clear pairingChatId here; it will be cleared on connection open
+    });
+
+    // --- Connection update (backup and state management) ---
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
 
-        // ---- pairing code generated ----
-        if (update.pairingCode) {
-            const code = update.pairingCode;   // e.g. "X7KM3F2Q"
+        // Fallback: some versions emit pairing code inside connection.update as well
+        if (update.pairingCode && pairingChatId) {
+            console.log('Pairing code from connection.update:', update.pairingCode);
+            const code = update.pairingCode;
             const display = code.slice(0,4) + '-' + code.slice(4);
-            bot.sendMessage(
+            await bot.sendMessage(
                 pairingChatId,
-                `🔐 *Your real linking code is ready*\n\n\`${display}\`\n\n(Type \`${code}\` without dash on that phone:\nWhatsApp → Linked Devices → Link a Device)`,
+                `🔐 *Real linking code ready*\n\n\`${display}\`\n\n(Type \`${code}\` on the target phone → Linked Devices → Link a Device)`,
                 { parse_mode: 'Markdown' }
             );
             return;
         }
 
-        // ---- connection open ----
         if (connection === 'open') {
             isConnected = true;
             if (pairingChatId) {
@@ -102,7 +114,6 @@ async function connectWhatsApp(chatId) {
             return;
         }
 
-        // ---- connection closed ----
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             if (statusCode === DisconnectReason.loggedOut) {
@@ -114,13 +125,13 @@ async function connectWhatsApp(chatId) {
                 }
                 return;
             }
-            // Reconnect silently
+            // Reconnect silently after 5s
             setTimeout(() => connectWhatsApp(chatId), 5000);
         }
     });
 }
 
-// ---- number check ----
+// --- File check (unchanged) ---
 bot.on('document', async (msg) => {
     if (msg.from.id !== MASTER_ID) return;
     if (!isConnected || !sock?.user) {
@@ -153,4 +164,4 @@ bot.on('document', async (msg) => {
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot running with native pairing code.');
+console.log('Bot started with pairing code listener');
