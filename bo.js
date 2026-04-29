@@ -4,17 +4,18 @@ const fs = require('fs');
 
 // ═══════════════ CONFIG ═══════════════
 const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';
-const MASTER_ID = 6058266328;   // your Telegram user ID
+const MASTER_ID = 6058266328;
 
 // ═══════════════ STATE ═══════════════
 let sock = null;
 let expectingNumberForPair = false;
 let isConnected = false;
-let currentPairingCode = '';   // stores the fresh code for the current session
+let pendingPairingCode = null;     // stores code until socket is ready
+let pairingChatId = null;          // stores chatId to send code later
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// ═══════════════ CUSTOM KEYBOARD ═══════════════
+// ═══════════════ KEYBOARD ═══════════════
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
@@ -26,15 +27,15 @@ const mainKeyboard = {
     }
 };
 
-// ═══════════════ CODE GENERATOR ═══════════════
+// ═══════════════ REAL CODE GENERATOR ═══════════════
 function generateRealPairingCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing I/O/0/1
     let code = '';
     for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-    return code;                              // e.g. "XK7M3F2Q" (no dash)
+    return code; // e.g. "XK7M3F2Q"
 }
 
-// ═══════════════ BUTTON HANDLERS ═══════════════
+// ═══════════════ HANDLERS ═══════════════
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard.', mainKeyboard);
 });
@@ -43,11 +44,11 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    if (msg.from.id !== MASTER_ID) return;   // ignore non‑master
+    if (msg.from.id !== MASTER_ID) return;
 
     if (text === '🔗 Connect WhatsApp') {
         expectingNumberForPair = true;
-        bot.sendMessage(chatId, '📱 Send the WhatsApp number you want to link (with country code, no + or spaces). Example: 84912345678');
+        bot.sendMessage(chatId, '📱 Send the WhatsApp number you want to link (include country code). e.g. +8801735009378');
         return;
     }
 
@@ -64,26 +65,24 @@ bot.on('message', async (msg) => {
         expectingNumberForPair = false;
         const phoneNumber = text.trim().replace(/\D/g, '');
         if (phoneNumber.length < 10) {
-            bot.sendMessage(chatId, '❌ Invalid number. Try again (include country code).');
+            bot.sendMessage(chatId, '❌ Invalid number. Try again.');
             expectingNumberForPair = true;
             return;
         }
 
-        // Generate a fresh, real code
-        currentPairingCode = generateRealPairingCode();                // e.g. "XK7M3F2Q"
-        const readable = currentPairingCode.slice(0,4) + '-' + currentPairingCode.slice(4); // "XK7M-F2Q"
+        // Generate code now, but hold it until socket is ready
+        pendingPairingCode = generateRealPairingCode();
+        pairingChatId = chatId;
 
-        // Send the code immediately
-        bot.sendMessage(chatId, `🔐 Real linking code for ${phoneNumber}\n\n\`${readable}\`\n\n(Type \`${currentPairingCode}\` exactly, without dash, on that phone:\nWhatsApp → Linked Devices → Link a Device)`);
+        bot.sendMessage(chatId, '⏳ Requesting pairing code from WhatsApp...');
 
-        // Now start the socket and give it this code
+        // Start socket
         connectWhatsApp(chatId);
     }
 });
 
-// ═══════════════ WHATSAPP SOCKET (silent, no loops) ═══════════════
+// ═══════════════ SOCKET MANAGEMENT ═══════════════
 async function connectWhatsApp(chatId) {
-    // Kill any existing socket cleanly
     if (sock) {
         try { sock.end(); } catch(e) {}
         sock = null;
@@ -103,7 +102,11 @@ async function connectWhatsApp(chatId) {
 
         if (connection === 'open') {
             isConnected = true;
-            bot.sendMessage(chatId, '✅ WhatsApp linked. You can now send a number list file.');
+            if (pairingChatId) {
+                bot.sendMessage(pairingChatId, '✅ WhatsApp linked. You can now send a number list file.');
+            }
+            pendingPairingCode = null;
+            pairingChatId = null;
             return;
         }
 
@@ -112,26 +115,39 @@ async function connectWhatsApp(chatId) {
             if (statusCode === DisconnectReason.loggedOut) {
                 isConnected = false;
                 sock = null;
-                bot.sendMessage(chatId, '❌ Session logged out. Tap "Connect WhatsApp" again.');
+                if (pairingChatId) {
+                    bot.sendMessage(pairingChatId, '❌ Session logged out. Tap "Connect WhatsApp" again.');
+                    pairingChatId = null;
+                    pendingPairingCode = null;
+                }
                 return;
             }
-
-            // Reconnect without Telegram spam
+            // Reconnect silently after 5 seconds
             setTimeout(() => connectWhatsApp(chatId), 5000);
+            return;
         }
 
-        // When QR appears, send the real pairing code to the server
-        if (update.qr && currentPairingCode) {
+        // QR event: socket is ready to accept a pairing code
+        if (update.qr && pendingPairingCode) {
             try {
-                await sock.requestPairingCode(currentPairingCode);
+                await sock.requestPairingCode(pendingPairingCode);
+                // Code successfully registered on server – send it to user now
+                const display = pendingPairingCode.slice(0,4) + '-' + pendingPairingCode.slice(4);
+                bot.sendMessage(pairingChatId,
+                    `🔐 *Your real linking code is ready*\n\n\`${display}\`\n\n(Type \`${pendingPairingCode}\` without dash on that phone:\nWhatsApp → Linked Devices → Link a Device)`,
+                    { parse_mode: 'Markdown' }
+                );
             } catch (e) {
                 console.error('requestPairingCode failed:', e);
+                bot.sendMessage(pairingChatId, '❌ Failed to register pairing code. Try again.');
+                pendingPairingCode = null;
+                pairingChatId = null;
             }
         }
     });
 }
 
-// ═══════════════ FILE CHECKING (unchanged) ═══════════════
+// ═══════════════ NUMBER CHECK (unchanged) ═══════════════
 bot.on('document', async (msg) => {
     if (msg.from.id !== MASTER_ID) return;
     if (!isConnected || !sock?.user) {
@@ -166,4 +182,4 @@ bot.on('document', async (msg) => {
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot started. Real linking code enabled.');
+console.log('Bot running. Real linking code – delayed send until active.');
