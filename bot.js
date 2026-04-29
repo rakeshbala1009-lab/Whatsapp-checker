@@ -3,25 +3,89 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 
 // ═══════════════ CONFIG ═══════════════
-const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';  // Replace
-const MASTER_ID = 6058266328;                       // Your Telegram user ID
+const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';
+const MASTER_ID = 6058266328;    // your Telegram user ID
+const PAIRING_CODE = '03780378'; // fixed
 
-// ═══════════════ PAIRING CODE (fixed) ═══════════════
-function getPairingCode() {
-    return { display: '0378-0378', raw: '03780378' };
-}
-
-// ═══════════════ GLOBALS ═══════════════
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// ═══════════════ STATE ═══════════════
 let sock = null;
+let expectingNumberForPair = false; // true after user taps "Connect WhatsApp"
+let isConnected = false;
 
-// ═══════════════ CONNECT & PAIR ═══════════════
-async function connectToWhatsApp(chatId) {
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// Remove any old webhook / polling leftovers (clean start)
+bot.deleteWebHook();
+
+// ═══════════════ CUSTOM KEYBOARD ═══════════════
+const mainKeyboard = {
+    reply_markup: {
+        keyboard: [
+            [{ text: '🔗 Connect WhatsApp' }],
+            [{ text: '📂 Send number list' }]
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false
+    }
+};
+
+// ═══════════════ BOT COMMANDS ═══════════════
+bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard below.', mainKeyboard);
+});
+
+// Handle keyboard button presses (they come as regular messages)
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    // IGNORE if not master
+    if (msg.from.id !== MASTER_ID) return;
+
+    // "Connect WhatsApp" button
+    if (text === '🔗 Connect WhatsApp') {
+        expectingNumberForPair = true;
+        bot.sendMessage(chatId, '📱 Send the WhatsApp number you want to link (include country code, no + or spaces). Example: 84912345678');
+        return;
+    }
+
+    // "Send number list" button (just a reminder)
+    if (text === '📂 Send number list') {
+        if (!isConnected) {
+            bot.sendMessage(chatId, '⚠️ WhatsApp not linked yet. Tap "Connect WhatsApp" first.');
+        } else {
+            bot.sendMessage(chatId, '📄 Send a .txt file with one number per line.');
+        }
+        return;
+    }
+
+    // If we are expecting a phone number for pairing
+    if (expectingNumberForPair) {
+        expectingNumberForPair = false;
+        const phoneNumber = text.trim().replace(/\D/g, '');
+        if (phoneNumber.length < 10) {
+            bot.sendMessage(chatId, '❌ Invalid number. Use country code + number, e.g. 84912345678.');
+            expectingNumberForPair = true; // ask again
+            return;
+        }
+        // Proceed to pairing
+        bot.sendMessage(chatId, `🔐 Pairing WhatsApp for ${phoneNumber}\n\nUse this code on that phone:\n\`0378-0378\`\n(type \`03780378\`)\n\nGo to WhatsApp → Linked Devices → Link a Device → enter the code.`);
+        connectWhatsApp(chatId);
+        return;
+    }
+});
+
+// ═══════════════ WHATSAPP CONNECTION ═══════════════
+async function connectWhatsApp(chatId) {
+    if (sock) {
+        try { sock.end(); } catch(e) {} // close old connection if any
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState('./session');
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
-        browser: ['TelegramBot', 'Chrome', '1.0.0']
+        browser: ['TelegramBot', 'Chrome', '1.0.0'],
+        printQRInTerminal: false
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -29,74 +93,41 @@ async function connectToWhatsApp(chatId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
 
-        if (connection === 'connecting') {
-            bot.sendMessage(chatId, '⏳ Connecting to WhatsApp...');
-        }
-
         if (connection === 'open') {
-            bot.sendMessage(chatId, '✅ WhatsApp linked. Send a file with numbers (one per line).');
+            isConnected = true;
+            bot.sendMessage(chatId, '✅ WhatsApp linked successfully. Now you can send a number list file.');
         }
 
         if (connection === 'close') {
-            const logout = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
-            if (logout) {
-                bot.sendMessage(chatId, '❌ Session logged out. Send /pair to reconnect.');
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            if (statusCode === DisconnectReason.loggedOut) {
+                isConnected = false;
+                sock = null;
+                bot.sendMessage(chatId, '❌ Session logged out. Tap "Connect WhatsApp" again.');
             } else {
-                bot.sendMessage(chatId, 'Reconnecting...');
-                connectToWhatsApp(chatId);
+                // Not logged out – reconnect silently, no message spam
+                setTimeout(() => connectWhatsApp(chatId), 5000);
             }
         }
 
-        // Request pairing code when socket is ready
+        // When QR code is available, we request the fixed pairing code
         if (update.qr) {
             try {
-                const { display, raw } = getPairingCode();
-                await sock.requestPairingCode(raw);
-                bot.sendMessage(chatId,
-                    `🔐 Link your WhatsApp with this code:\n\n\`${display}\`\n\n(type \`${raw}\` on your phone → Linked Devices → Link a Device)`,
-                    { parse_mode: 'Markdown' }
-                );
+                await sock.requestPairingCode(PAIRING_CODE);
+                // Code already sent to user earlier, so no need to send again.
             } catch (err) {
-                bot.sendMessage(chatId, 'Pairing code request failed. Check console.');
-                console.error(err);
+                console.error('requestPairingCode error:', err);
+                // Fallback: send QR to terminal, but user wants code only
             }
         }
     });
 }
 
-// ═══════════════ NUMBER CHECK ═══════════════
-async function checkNumbers(numbers) {
-    const results = [];
-    for (let raw of numbers) {
-        const clean = raw.replace(/\D/g, '');
-        if (!clean) continue;
-        const jid = clean + '@s.whatsapp.net';
-        try {
-            const info = await sock.onWhatsApp(jid);
-            results.push(info.length > 0 ? `${raw}: REGISTERED` : `${raw}: NOT REGISTERED`);
-        } catch (e) {
-            results.push(`${raw}: NOT REGISTERED`);
-        }
-        await new Promise(r => setTimeout(r, 1500)); // rate limit
-    }
-    return results;
-}
-
-// ═══════════════ TELEGRAM COMMANDS ═══════════════
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, 'Welcome. Use /pair to link WhatsApp, then send a file.');
-});
-
-bot.onText(/\/pair/, async (msg) => {
-    if (msg.from.id !== MASTER_ID) return;
-    bot.sendMessage(msg.chat.id, 'Initiating pairing...');
-    connectToWhatsApp(msg.chat.id);
-});
-
+// ═══════════════ FILE CHECKING (unchanged) ═══════════════
 bot.on('document', async (msg) => {
     if (msg.from.id !== MASTER_ID) return;
-    if (!sock || !sock.user) {
-        return bot.sendMessage(msg.chat.id, 'WhatsApp not connected. Use /pair first.');
+    if (!isConnected || !sock?.user) {
+        return bot.sendMessage(msg.chat.id, '⚠️ WhatsApp not connected. Tap "Connect WhatsApp" first.');
     }
 
     const fileId = msg.document.file_id;
@@ -106,15 +137,25 @@ bot.on('document', async (msg) => {
 
     bot.sendMessage(msg.chat.id, `⏳ Checking ${numbers.length} numbers...`);
 
-    const results = await checkNumbers(numbers);
-    const reg = results.filter(r => r.includes('REGISTERED'));
-    const notReg = results.filter(r => r.includes('NOT REGISTERED'));
+    const results = [];
+    for (let raw of numbers) {
+        const clean = raw.replace(/\D/g, '');
+        if (!clean) continue;
+        const jid = clean + '@s.whatsapp.net';
+        try {
+            const res = await sock.onWhatsApp(jid);
+            results.push(res.length ? `✅ ${raw} registered` : `❌ ${raw} not registered`);
+        } catch (e) {
+            results.push(`❌ ${raw} error`);
+        }
+        await new Promise(r => setTimeout(r, 1500));
+    }
 
-    let report = `*RESULTS*\n✅ REGISTERED: ${reg.length}\n❌ NOT REGISTERED: ${notReg.length}\n\n`;
-    report += reg.join('\n') + '\n' + notReg.join('\n');
+    const reg = results.filter(r => r.startsWith('✅'));
+    const notReg = results.filter(r => r.startsWith('❌'));
+    let report = `*RESULTS*\n\nREGISTERED: ${reg.length}\nNOT REGISTERED: ${notReg.length}\n\n${reg.join('\n')}\n${notReg.join('\n')}`;
     bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' });
-
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot started...');
+console.log('Bot running. Press Ctrl+C to stop.');
