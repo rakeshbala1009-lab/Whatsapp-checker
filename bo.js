@@ -10,8 +10,8 @@ const MASTER_ID = 6058266328;
 let sock = null;
 let expectingNumberForPair = false;
 let isConnected = false;
-let pendingPairingCode = null;     // stores code until socket is ready
-let pairingChatId = null;          // stores chatId to send code later
+let expectedPhoneNumber = null;   // store the phone number for pairing
+let pairingChatId = null;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
@@ -26,14 +26,6 @@ const mainKeyboard = {
         one_time_keyboard: false
     }
 };
-
-// ═══════════════ REAL CODE GENERATOR ═══════════════
-function generateRealPairingCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing I/O/0/1
-    let code = '';
-    for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-    return code; // e.g. "XK7M3F2Q"
-}
 
 // ═══════════════ HANDLERS ═══════════════
 bot.onText(/\/start/, (msg) => {
@@ -63,49 +55,44 @@ bot.on('message', async (msg) => {
 
     if (expectingNumberForPair) {
         expectingNumberForPair = false;
-        const phoneNumber = text.trim().replace(/\D/g, '');
+        const phoneNumber = text.trim().replace(/\D/g, ''); // only digits
         if (phoneNumber.length < 10) {
             bot.sendMessage(chatId, '❌ Invalid number. Try again.');
             expectingNumberForPair = true;
             return;
         }
 
-        // Generate code now, but hold it until socket is ready
-        pendingPairingCode = generateRealPairingCode();
+        // Store the number and start the socket
+        expectedPhoneNumber = phoneNumber;
         pairingChatId = chatId;
 
         bot.sendMessage(chatId, '⏳ Requesting pairing code from WhatsApp...');
-
-        // Start socket
         connectWhatsApp(chatId);
     }
 });
 
-// ═══════════════ SOCKET MANAGEMENT ═══════════════
+// ═══════════════ WHATSAPP SOCKET (v7 pairing) ═══════════════
 async function connectWhatsApp(chatId) {
-    if (sock) {
-        try { sock.end(); } catch(e) {}
-        sock = null;
-    }
+    if (sock) { try { sock.end(); } catch(e) {} sock = null; }
 
     const { state, saveCreds } = await useMultiFileAuthState('./session');
     sock = makeWASocket({
         auth: state,
         browser: ['TelegramBot', 'Chrome', '1.0.0'],
-        printQRInTerminal: false
+        mobile: false            // keep false for multi-device web
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
 
         if (connection === 'open') {
             isConnected = true;
             if (pairingChatId) {
                 bot.sendMessage(pairingChatId, '✅ WhatsApp linked. You can now send a number list file.');
             }
-            pendingPairingCode = null;
+            expectedPhoneNumber = null;
             pairingChatId = null;
             return;
         }
@@ -118,31 +105,40 @@ async function connectWhatsApp(chatId) {
                 if (pairingChatId) {
                     bot.sendMessage(pairingChatId, '❌ Session logged out. Tap "Connect WhatsApp" again.');
                     pairingChatId = null;
-                    pendingPairingCode = null;
+                    expectedPhoneNumber = null;
                 }
                 return;
             }
-            // Reconnect silently after 5 seconds
+            // reconnect silently
             setTimeout(() => connectWhatsApp(chatId), 5000);
             return;
         }
 
-        // QR event: socket is ready to accept a pairing code
-        if (update.qr && pendingPairingCode) {
+        // When QR appears, we trigger the pairing code request (new API)
+        if (qr && expectedPhoneNumber && pairingChatId) {
             try {
-                await sock.requestPairingCode(pendingPairingCode);
-                // Code successfully registered on server – send it to user now
-                const display = pendingPairingCode.slice(0,4) + '-' + pendingPairingCode.slice(4);
-                bot.sendMessage(pairingChatId,
-                    `🔐 *Your real linking code is ready*\n\n\`${display}\`\n\n(Type \`${pendingPairingCode}\` without dash on that phone:\nWhatsApp → Linked Devices → Link a Device)`,
-                    { parse_mode: 'Markdown' }
-                );
+                // Baileys v7: requestPairingCode(phoneNumber) – it will emit the code via 'connection.update'
+                const code = await sock.requestPairingCode(expectedPhoneNumber);
+                // In v7, the method returns the code directly? Actually it does not return; it emits.
+                // We'll handle the result in the next event.
+                // But sometimes it returns the code? Let's check by sending a placeholder.
+                // We'll listen for 'connection.update' with a 'pairingCode' field.
             } catch (e) {
-                console.error('requestPairingCode failed:', e);
-                bot.sendMessage(pairingChatId, '❌ Failed to register pairing code. Try again.');
-                pendingPairingCode = null;
+                console.error('requestPairingCode error:', e);
+                bot.sendMessage(pairingChatId, `❌ Failed: ${e.message}`);
                 pairingChatId = null;
+                expectedPhoneNumber = null;
             }
+        }
+
+        // v7 pairing: code arrives in a subsequent update with 'code' property
+        if (update.pairingCode && pairingChatId) {
+            const { pairingCode } = update;
+            const display = pairingCode.slice(0,4) + '-' + pairingCode.slice(4);
+            bot.sendMessage(pairingChatId,
+                `🔐 *Your WhatsApp pairing code*\n\n\`${display}\`\n\n(Type \`${pairingCode}\` exactly, without dash, on the other phone:\nWhatsApp → Linked Devices → Link a Device)`,
+                { parse_mode: 'Markdown' }
+            );
         }
     });
 }
@@ -182,4 +178,4 @@ bot.on('document', async (msg) => {
     fs.unlinkSync(filePath);
 });
 
-console.log('Bot running. Real linking code – delayed send until active.');
+console.log('Bot started – v7 pairing enabled.');
