@@ -1,29 +1,27 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
+const path = require('path');
 
 // ═══════════════ CONFIG ═══════════════
-const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';
+const TELEGRAM_TOKEN = '8752592084:AAFnnKL53CVHAgR-gWhvPgUDdhwDAO18L0k';
 
 // ═══════════════ STATE ═══════════════
 let expectingMaytapiUrl = false;
 let isConnected = false;
 
-// API pool & active instance
-let apiPool = [];                     // { productId, phoneId, token, chatId }
-let activeApi = null;                 // same type as above, but currently used
+let apiPool = [];
+let activeApi = null;
 let activeStatusPollInterval = null;
 
-// Number checking progress
 let checkingChatId = null;
 let checkingMessageId = null;
 let checkingTotal = 0;
 let checkingDone = 0;
-let checkingResults = [];            // { number, registered }
+let checkingResults = [];
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// keyboard
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
@@ -35,7 +33,6 @@ const mainKeyboard = {
     }
 };
 
-// helpers
 function cleanNumber(raw) {
     return raw.replace(/\D/g, '');
 }
@@ -52,7 +49,7 @@ function parseMaytapiUrl(url) {
     return { productId, phoneId, token };
 }
 
-// ─── Maytapi API helpers (uses an API entry) ───
+// Maytapi helpers
 async function getQrCode(api) {
     const url = `https://api.maytapi.com/api/${api.productId}/${api.phoneId}/screen?token=${api.token}`;
     const resp = await axios.get(url, { responseType: 'arraybuffer' });
@@ -89,50 +86,41 @@ async function checkNumber(api, phoneNumber) {
     return resp.data;
 }
 
-// ─── Pool management ───
+// Pool management
 function findApiIndex(api) {
     return apiPool.findIndex(a => a.productId === api.productId && a.phoneId === api.phoneId);
 }
 
 async function trySetActiveFromPool(chatId = null) {
-    // Stop any existing polling
     if (activeStatusPollInterval) {
         clearInterval(activeStatusPollInterval);
         activeStatusPollInterval = null;
     }
-
-    // If we already have an active API that is connected, keep it
     if (activeApi) {
         try {
             const st = await getStatus(activeApi);
             if (isStatusConnected(st)) {
                 isConnected = true;
-                return true; // still good
+                return true;
             }
         } catch (e) {}
-        // Active is dead, remove it from pool
         const idx = findApiIndex(activeApi);
         if (idx !== -1) apiPool.splice(idx, 1);
         activeApi = null;
     }
-
-    // Pick the first connected API from the pool
     for (let i = 0; i < apiPool.length; i++) {
         try {
             const st = await getStatus(apiPool[i]);
             if (isStatusConnected(st)) {
-                activeApi = apiPool.splice(i, 1)[0]; // remove from pool, store as active
+                activeApi = apiPool.splice(i, 1)[0];
                 isConnected = true;
-                // Start polling for this active API
                 activeStatusPollInterval = setInterval(async () => {
                     try {
                         const status = await getStatus(activeApi);
                         if (!isStatusConnected(status)) {
-                            // Active died, switch
                             await trySetActiveFromPool(null);
                         }
                     } catch (e) {
-                        // connection error, treat as dead
                         await trySetActiveFromPool(null);
                     }
                 }, 10000);
@@ -140,13 +128,12 @@ async function trySetActiveFromPool(chatId = null) {
             }
         } catch (e) {}
     }
-    // No connected API available
     isConnected = false;
     activeApi = null;
     return false;
 }
 
-// ─── Progress updating ───
+// Progress update
 async function updateProgress() {
     if (!checkingChatId || !checkingMessageId) return;
     try {
@@ -154,14 +141,27 @@ async function updateProgress() {
             `Number checking ${checkingDone}/${checkingTotal}`,
             { chat_id: checkingChatId, message_id: checkingMessageId }
         );
-    } catch (e) {
-        if (e.response && e.response.statusCode === 400) {
-            // message deleted or not modified, ignore
-        }
-    }
+    } catch (e) {}
 }
 
-// ─── Bot handlers ───
+// Concurrency limiter
+async function asyncPool(poolLimit, array, iteratorFn) {
+    const ret = [];
+    const executing = new Set();
+    for (const item of array) {
+        const p = Promise.resolve().then(() => iteratorFn(item));
+        ret.push(p);
+        executing.add(p);
+        const clean = () => executing.delete(p);
+        p.then(clean, clean);
+        if (executing.size >= poolLimit) {
+            await Promise.race(executing);
+        }
+    }
+    return Promise.all(ret);
+}
+
+// ═══════════════ BOT HANDLERS ═══════════════
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard.', mainKeyboard);
 });
@@ -171,7 +171,6 @@ bot.on('message', async (msg) => {
     const text = msg.text;
     if (!text) return;
 
-    // ── Connect button ──
     if (text === '🔗 Connect WhatsApp') {
         expectingMaytapiUrl = true;
         bot.sendMessage(chatId,
@@ -182,23 +181,17 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // ── Disconnect button ──
     if (text === '🔌 Disconnect') {
         if (!activeApi) {
             bot.sendMessage(chatId, '⚠️ No active WhatsApp instance to disconnect.');
             return;
         }
-
-        // Stop polling, remove active, try next pool
         if (activeStatusPollInterval) {
             clearInterval(activeStatusPollInterval);
             activeStatusPollInterval = null;
         }
-        // Actually we remove active API entirely; user requested disconnect.
-        // We won't put it back into pool. Let it be gone.
         activeApi = null;
         isConnected = false;
-
         bot.sendMessage(chatId, '🔌 Disconnected. Looking for another connected instance...');
         const switched = await trySetActiveFromPool(chatId);
         if (switched) {
@@ -209,7 +202,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // ── Send number list button ──
     if (text === '📂 Send number list') {
         if (!isConnected) {
             bot.sendMessage(chatId, '⚠️ No active WhatsApp instance. Tap "Connect WhatsApp" first.');
@@ -219,7 +211,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // ── User sent Maytapi URL ──
     if (expectingMaytapiUrl) {
         expectingMaytapiUrl = false;
         const parsed = parseMaytapiUrl(text.trim());
@@ -227,19 +218,13 @@ bot.on('message', async (msg) => {
             bot.sendMessage(chatId, '❌ Invalid URL format. Tap "Connect WhatsApp" and send a valid Maytapi screen URL.');
             return;
         }
-
-        // Check if already in pool or active
         const existsActive = activeApi && activeApi.productId === parsed.productId && activeApi.phoneId === parsed.phoneId;
         const existsPool = apiPool.some(a => a.productId === parsed.productId && a.phoneId === parsed.phoneId);
         if (existsActive || existsPool) {
             bot.sendMessage(chatId, '⚠️ This API is already in the pool.');
             return;
         }
-
-        // Add to pool (with chatId for reference, though not used much)
         apiPool.push({ ...parsed, chatId });
-
-        // Check if we can use it immediately
         const connected = await trySetActiveFromPool(chatId);
         if (connected) {
             const st = await getStatus(activeApi);
@@ -252,23 +237,22 @@ bot.on('message', async (msg) => {
     }
 });
 
-// ── File check ──
+// ── File check (lightning fast, fresh‑only file) ──
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     if (!isConnected || !activeApi) {
         return bot.sendMessage(chatId, '⚠️ No active WhatsApp instance. Tap "Connect WhatsApp" first.');
     }
-
     try {
         const filePath = await bot.downloadFile(msg.document.file_id, './');
         const content = fs.readFileSync(filePath, 'utf-8');
         const numbers = content.split(/\r?\n/).map(l => l.trim()).filter(l => l);
         fs.unlinkSync(filePath);
 
-        // Initialize progress
+        // Reset progress
         checkingChatId = chatId;
-        checkingDone = 0;
         checkingTotal = numbers.length;
+        checkingDone = 0;
         checkingResults = [];
 
         const progressMsg = await bot.sendMessage(chatId, `Number checking 0/${checkingTotal}`);
@@ -277,13 +261,16 @@ bot.on('document', async (msg) => {
         const registered = [];
         const fresh = [];
 
-        for (let raw of numbers) {
+        // Concurrency limit – tune this number as per Maytapi limits (20–50 works fine)
+        const CONCURRENCY = 100;
+
+        await asyncPool(CONCURRENCY, numbers, async (raw) => {
             const clean = cleanNumber(raw);
             if (!clean) {
                 checkingDone++;
-                continue;
+                await updateProgress();
+                return;
             }
-
             let reg = false;
             try {
                 const res = await checkNumber(activeApi, clean);
@@ -291,25 +278,19 @@ bot.on('document', async (msg) => {
                     reg = true;
                 }
             } catch (e) {
-                reg = false; // error treated as not registered
+                reg = false;
             }
-
             if (reg) registered.push(clean);
             else fresh.push(clean);
 
             checkingDone++;
             await updateProgress();
+        });
 
-            // Rate limit: 50ms for ~20 checks/sec
-            await new Promise(r => setTimeout(r, 50));
-        }
+        // Delete progress
+        try { await bot.deleteMessage(chatId, checkingMessageId); } catch (e) {}
 
-        // Delete progress message
-        try {
-            await bot.deleteMessage(chatId, checkingMessageId);
-        } catch (e) {}
-
-        // Build final report
+        // Build message report
         let report = '';
         if (registered.length > 0) {
             report += '*Already Created Account Number ✅ :*\n';
@@ -319,11 +300,19 @@ bot.on('document', async (msg) => {
             report += '*Fresh Number ❌*\n';
             report += fresh.map(n => `+${n}`).join('\n');
         }
-
         if (report) {
             await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+        }
+
+        // Send fresh numbers as a .txt file
+        if (fresh.length > 0) {
+            const freshContent = fresh.map(n => `+${n}`).join('\n');
+            const filePathFresh = path.join(__dirname, 'Freash_Number.txt');
+            fs.writeFileSync(filePathFresh, freshContent, 'utf-8');
+            await bot.sendDocument(chatId, filePathFresh, { caption: `Fresh numbers (${fresh.length})` });
+            fs.unlinkSync(filePathFresh);
         } else {
-            await bot.sendMessage(chatId, 'All numbers processed (no valid numbers).');
+            await bot.sendMessage(chatId, 'No fresh numbers found.');
         }
 
     } catch (err) {
@@ -332,4 +321,4 @@ bot.on('document', async (msg) => {
     }
 });
 
-console.log('Bot running – shared API pool, 20/s checks, live progress');
+console.log('Bot running – lightning speed checks, fresh‑only file');
