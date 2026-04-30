@@ -4,15 +4,22 @@ const fs = require('fs');
 
 // ═══════════════ CONFIG ═══════════════
 const TELEGRAM_TOKEN = '8216427126:AAHF1CFTy-YG5lTJRaJpC_k0pyeWtZdSbiA';
-const MASTER_ID = 6058266328;
 
 // ═══════════════ STATE ═══════════════
 let expectingMaytapiUrl = false;
 let isConnected = false;
-let maytapiProductId = null;
-let maytapiPhoneId = null;
-let maytapiToken = null;
-let statusPollInterval = null;
+
+// API pool & active instance
+let apiPool = [];                     // { productId, phoneId, token, chatId }
+let activeApi = null;                 // same type as above, but currently used
+let activeStatusPollInterval = null;
+
+// Number checking progress
+let checkingChatId = null;
+let checkingMessageId = null;
+let checkingTotal = 0;
+let checkingDone = 0;
+let checkingResults = [];            // { number, registered }
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
@@ -20,7 +27,7 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
-            [{ text: '🔗 Connect WhatsApp' }],
+            [{ text: '🔗 Connect WhatsApp' }, { text: '🔌 Disconnect' }],
             [{ text: '📂 Send number list' }]
         ],
         resize_keyboard: true,
@@ -28,123 +35,184 @@ const mainKeyboard = {
     }
 };
 
-// helper: strip non-digits
+// helpers
 function cleanNumber(raw) {
     return raw.replace(/\D/g, '');
 }
 
-// helper: parse Maytapi URL → product_id, phone_id, token
 function parseMaytapiUrl(url) {
-    // matches /api/{product_id}/{phone_id}/(screen|status|qrCode)?...
     const regex = /\/api\/([^\/]+)\/([^\/]+)\/(?:screen|status|qrCode)(?:\?|$)/;
     const match = url.match(regex);
     if (!match) return null;
-
     const productId = match[1];
     const phoneId = match[2];
-
-    // extract token from query string
     const urlObj = new URL(url);
     const token = urlObj.searchParams.get('token');
     if (!token) return null;
-
     return { productId, phoneId, token };
 }
 
-// --- Maytapi API helpers ---
-async function getQrCode() {
-    const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/screen?token=${maytapiToken}`;
+// ─── Maytapi API helpers (uses an API entry) ───
+async function getQrCode(api) {
+    const url = `https://api.maytapi.com/api/${api.productId}/${api.phoneId}/screen?token=${api.token}`;
     const resp = await axios.get(url, { responseType: 'arraybuffer' });
-    return resp.data;  // PNG buffer
-}
-
-async function getRawStatus() {
-    const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/status?token=${maytapiToken}`;
-    const resp = await axios.get(url);
-    console.log('Maytapi status raw:', resp.data);
     return resp.data;
 }
 
-// Returns true if the status response indicates connected
+async function getStatus(api) {
+    const url = `https://api.maytapi.com/api/${api.productId}/${api.phoneId}/status?token=${api.token}`;
+    const resp = await axios.get(url);
+    return resp.data;
+}
+
 function isStatusConnected(raw) {
     if (!raw) return false;
-    // Direct string "connected"
     if (typeof raw === 'string' && raw.toLowerCase() === 'connected') return true;
-
-    // Maytapi v2 format (your response): status.loggedIn, status.state.state='CONNECTED'
     if (raw.status) {
         if (raw.status.loggedIn === true) return true;
         if (raw.status.state && raw.status.state.state === 'CONNECTED') return true;
     }
-
-    // Maytapi v1 / other formats
     if (raw.connected === true) return true;
     if (raw.status === 'connected') return true;
     if (raw.result && raw.result.status && raw.result.status.toString() === '200') return true;
     return false;
 }
 
-// Extract profile info: returns { name, phone } or null
-function extractProfile(raw) {
-    if (!raw) return null;
-    let name = raw.name || raw.pushname || raw.senderName || '';
-    let phone = raw.phone || raw.meUser || '';
-
-    // Maytapi v2 (your response with status.number)
-    if (raw.status) {
-        if (!phone) phone = raw.status.number || raw.number || '';
-        if (!name) name = raw.status.name || raw.status.pushname || raw.status.senderName || '';
-    }
-
-    // Fallback: result.user
-    if (!name && raw.result && raw.result.user) {
-        name = raw.result.user.name || raw.result.user.pushname || '';
-        phone = phone || raw.result.user.phone || raw.result.user.number || '';
-    }
-
-    phone = phone.replace(/@c\.us$/, '').replace(/\D/g, '');
-    if (name && phone) return { name, phone };
-    if (phone) return { name: null, phone };   // only number available
-    return null;
-}
-
-async function checkNumber(phoneNumber) {
-    const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/checkNumberStatus`;
+async function checkNumber(api, phoneNumber) {
+    const url = `https://api.maytapi.com/api/${api.productId}/${api.phoneId}/checkNumberStatus`;
     const resp = await axios.get(url, {
         params: {
-            token: maytapiToken,
+            token: api.token,
             number: `${phoneNumber}@c.us`
         }
     });
     return resp.data;
 }
 
-// --- Bot handlers ---
+// ─── Pool management ───
+function findApiIndex(api) {
+    return apiPool.findIndex(a => a.productId === api.productId && a.phoneId === api.phoneId);
+}
+
+async function trySetActiveFromPool(chatId = null) {
+    // Stop any existing polling
+    if (activeStatusPollInterval) {
+        clearInterval(activeStatusPollInterval);
+        activeStatusPollInterval = null;
+    }
+
+    // If we already have an active API that is connected, keep it
+    if (activeApi) {
+        try {
+            const st = await getStatus(activeApi);
+            if (isStatusConnected(st)) {
+                isConnected = true;
+                return true; // still good
+            }
+        } catch (e) {}
+        // Active is dead, remove it from pool
+        const idx = findApiIndex(activeApi);
+        if (idx !== -1) apiPool.splice(idx, 1);
+        activeApi = null;
+    }
+
+    // Pick the first connected API from the pool
+    for (let i = 0; i < apiPool.length; i++) {
+        try {
+            const st = await getStatus(apiPool[i]);
+            if (isStatusConnected(st)) {
+                activeApi = apiPool.splice(i, 1)[0]; // remove from pool, store as active
+                isConnected = true;
+                // Start polling for this active API
+                activeStatusPollInterval = setInterval(async () => {
+                    try {
+                        const status = await getStatus(activeApi);
+                        if (!isStatusConnected(status)) {
+                            // Active died, switch
+                            await trySetActiveFromPool(null);
+                        }
+                    } catch (e) {
+                        // connection error, treat as dead
+                        await trySetActiveFromPool(null);
+                    }
+                }, 10000);
+                return true;
+            }
+        } catch (e) {}
+    }
+    // No connected API available
+    isConnected = false;
+    activeApi = null;
+    return false;
+}
+
+// ─── Progress updating ───
+async function updateProgress() {
+    if (!checkingChatId || !checkingMessageId) return;
+    try {
+        await bot.editMessageText(
+            `Number checking ${checkingDone}/${checkingTotal}`,
+            { chat_id: checkingChatId, message_id: checkingMessageId }
+        );
+    } catch (e) {
+        if (e.response && e.response.statusCode === 400) {
+            // message deleted or not modified, ignore
+        }
+    }
+}
+
+// ─── Bot handlers ───
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, 'Welcome. Use keyboard.', mainKeyboard);
+    bot.sendMessage(msg.chat.id, 'Welcome. Use the keyboard.', mainKeyboard);
 });
 
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
-    if (msg.from.id !== MASTER_ID) return;
+    if (!text) return;
 
     // ── Connect button ──
     if (text === '🔗 Connect WhatsApp') {
         expectingMaytapiUrl = true;
         bot.sendMessage(chatId,
             '🔗 Send your Maytapi screen URL.\n\n' +
-            'Format: `https://api.maytapi.com/api/{product_id}/{phone_id}/screen?token=...`\n\n' +
-            'Example: `https://api.maytapi.com/api/d4eb8e07-ee12-4dfd-a601-6eb5642d85ed/141261/screen?token=0746191c-8978-4b44-b5f7-39d86b90f04a`',
+            'Format: `https://api.maytapi.com/api/{product_id}/{phone_id}/screen?token=...`',
             { parse_mode: 'Markdown' }
         );
+        return;
+    }
+
+    // ── Disconnect button ──
+    if (text === '🔌 Disconnect') {
+        if (!activeApi) {
+            bot.sendMessage(chatId, '⚠️ No active WhatsApp instance to disconnect.');
+            return;
+        }
+
+        // Stop polling, remove active, try next pool
+        if (activeStatusPollInterval) {
+            clearInterval(activeStatusPollInterval);
+            activeStatusPollInterval = null;
+        }
+        // Actually we remove active API entirely; user requested disconnect.
+        // We won't put it back into pool. Let it be gone.
+        activeApi = null;
+        isConnected = false;
+
+        bot.sendMessage(chatId, '🔌 Disconnected. Looking for another connected instance...');
+        const switched = await trySetActiveFromPool(chatId);
+        if (switched) {
+            bot.sendMessage(chatId, '✅ Switched to another WhatsApp instance.');
+        } else {
+            bot.sendMessage(chatId, '❌ No other WhatsApp instance available.');
+        }
         return;
     }
 
     // ── Send number list button ──
     if (text === '📂 Send number list') {
         if (!isConnected) {
-            bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
+            bot.sendMessage(chatId, '⚠️ No active WhatsApp instance. Tap "Connect WhatsApp" first.');
         } else {
             bot.sendMessage(chatId, '📄 Send a .txt file with one number per line.');
         }
@@ -154,102 +222,40 @@ bot.on('message', async (msg) => {
     // ── User sent Maytapi URL ──
     if (expectingMaytapiUrl) {
         expectingMaytapiUrl = false;
-
         const parsed = parseMaytapiUrl(text.trim());
         if (!parsed) {
             bot.sendMessage(chatId, '❌ Invalid URL format. Tap "Connect WhatsApp" and send a valid Maytapi screen URL.');
             return;
         }
 
-        maytapiProductId = parsed.productId;
-        maytapiPhoneId = parsed.phoneId;
-        maytapiToken = parsed.token;
-
-        // ---- Step 1: Check if already connected ----
-        let alreadyConnected = false;
-        try {
-            const statusRaw = await getRawStatus();
-            if (isStatusConnected(statusRaw)) {
-                alreadyConnected = true;
-                const profile = extractProfile(statusRaw);
-                const confirmText = profile?.name
-                    ? `✅ Already connected as *${profile.name}* (+${profile.phone})`
-                    : profile?.phone
-                        ? `✅ Already connected as +${profile.phone}`
-                        : '✅ WhatsApp already connected.';
-                bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
-                isConnected = true;
-                if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
-            }
-        } catch (e) {
-            console.error('Initial status check error:', e.message);
-            // continue to QR
+        // Check if already in pool or active
+        const existsActive = activeApi && activeApi.productId === parsed.productId && activeApi.phoneId === parsed.phoneId;
+        const existsPool = apiPool.some(a => a.productId === parsed.productId && a.phoneId === parsed.phoneId);
+        if (existsActive || existsPool) {
+            bot.sendMessage(chatId, '⚠️ This API is already in the pool.');
+            return;
         }
 
-        if (alreadyConnected) return;
+        // Add to pool (with chatId for reference, though not used much)
+        apiPool.push({ ...parsed, chatId });
 
-        // ---- Step 2: Not connected → fetch QR and poll ----
-        bot.sendMessage(chatId, '⏳ Fetching QR code from Maytapi...');
-        try {
-            const qrBuffer = await getQrCode();
-            const imgPath = `./qr_${Date.now()}.png`;
-            fs.writeFileSync(imgPath, qrBuffer);
-
-            await bot.sendPhoto(chatId, imgPath, {
-                caption: '📷 Scan this QR code on the target phone:\n\nWhatsApp → Linked Devices → Link a Device\n\n*Bot will notify you once connected.*',
-                parse_mode: 'Markdown'
-            });
-            fs.unlinkSync(imgPath);
-
-            bot.sendMessage(chatId, '⏳ Waiting for you to scan the QR code...');
-
-            // Clear any existing poll
-            if (statusPollInterval) clearInterval(statusPollInterval);
-
-            let attempts = 0;
-            statusPollInterval = setInterval(async () => {
-                attempts++;
-                try {
-                    const st = await getRawStatus();
-                    if (isStatusConnected(st)) {
-                        clearInterval(statusPollInterval);
-                        statusPollInterval = null;
-                        isConnected = true;
-                        const profile = extractProfile(st);
-                        const confirmText = profile?.name
-                            ? `✅ WhatsApp linked as *${profile.name}* (+${profile.phone})`
-                            : profile?.phone
-                                ? `✅ WhatsApp linked as +${profile.phone}`
-                                : '✅ WhatsApp linked.';
-                        bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
-                        return;
-                    }
-                } catch (err) {
-                    // keep polling silently
-                }
-
-                if (attempts >= 120) {
-                    clearInterval(statusPollInterval);
-                    statusPollInterval = null;
-                    bot.sendMessage(chatId, '❌ Linking timed out (10 min). Tap "Connect WhatsApp" to try again.');
-                }
-            }, 5000);
-
-        } catch (err) {
-            console.error('QR fetch error:', err.response?.data || err.message);
-            bot.sendMessage(chatId, '❌ Failed to fetch QR code. Check your Maytapi URL and ensure the phone is active.');
-            maytapiProductId = null;
-            maytapiPhoneId = null;
-            maytapiToken = null;
+        // Check if we can use it immediately
+        const connected = await trySetActiveFromPool(chatId);
+        if (connected) {
+            const st = await getStatus(activeApi);
+            const number = st.status ? st.status.number || st.number : st.number;
+            bot.sendMessage(chatId, `✅ WhatsApp connected (+${number}). The bot is now using this instance.`);
+        } else {
+            bot.sendMessage(chatId, '📌 API added to pool. It is either not connected or another instance is already active. The bot will use the first available connected instance.');
         }
+        return;
     }
 });
 
-// ── File check (unchanged) ──
+// ── File check ──
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
-    if (msg.from.id !== MASTER_ID) return;
-    if (!isConnected) {
+    if (!isConnected || !activeApi) {
         return bot.sendMessage(chatId, '⚠️ No active WhatsApp instance. Tap "Connect WhatsApp" first.');
     }
 
@@ -259,30 +265,66 @@ bot.on('document', async (msg) => {
         const numbers = content.split(/\r?\n/).map(l => l.trim()).filter(l => l);
         fs.unlinkSync(filePath);
 
-        bot.sendMessage(chatId, `⏳ Checking ${numbers.length} numbers via Maytapi...`);
+        // Initialize progress
+        checkingChatId = chatId;
+        checkingDone = 0;
+        checkingTotal = numbers.length;
+        checkingResults = [];
 
-        const results = [];
+        const progressMsg = await bot.sendMessage(chatId, `Number checking 0/${checkingTotal}`);
+        checkingMessageId = progressMsg.message_id;
+
+        const registered = [];
+        const fresh = [];
+
         for (let raw of numbers) {
             const clean = cleanNumber(raw);
-            if (!clean) continue;
+            if (!clean) {
+                checkingDone++;
+                continue;
+            }
+
+            let reg = false;
             try {
-                const res = await checkNumber(clean);
-                // Maytapi returns: { success: true, result: { status: 200 } } when registered
+                const res = await checkNumber(activeApi, clean);
                 if (res.success && res.result && res.result.status === 200) {
-                    results.push(`✅ ${raw}`);
-                } else {
-                    results.push(`❌ ${raw}`);
+                    reg = true;
                 }
             } catch (e) {
-                results.push(`❌ ${raw} (error)`);
+                reg = false; // error treated as not registered
             }
-            await new Promise(r => setTimeout(r, 500)); // rate limit
+
+            if (reg) registered.push(clean);
+            else fresh.push(clean);
+
+            checkingDone++;
+            await updateProgress();
+
+            // Rate limit: 50ms for ~20 checks/sec
+            await new Promise(r => setTimeout(r, 50));
         }
 
-        const reg = results.filter(r => r.startsWith('✅'));
-        const notReg = results.filter(r => r.startsWith('❌'));
-        let report = `*RESULTS*\n\nREGISTERED: ${reg.length}\nNOT REGISTERED: ${notReg.length}\n\n${reg.join('\n')}\n${notReg.join('\n')}`;
-        bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+        // Delete progress message
+        try {
+            await bot.deleteMessage(chatId, checkingMessageId);
+        } catch (e) {}
+
+        // Build final report
+        let report = '';
+        if (registered.length > 0) {
+            report += '*Already Created Account Number ✅ :*\n';
+            report += registered.join('\n') + '\n\n';
+        }
+        if (fresh.length > 0) {
+            report += '*Fresh Number ❌*\n';
+            report += fresh.map(n => `+${n}`).join('\n');
+        }
+
+        if (report) {
+            await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+        } else {
+            await bot.sendMessage(chatId, 'All numbers processed (no valid numbers).');
+        }
 
     } catch (err) {
         console.error('File/check error:', err);
@@ -290,4 +332,4 @@ bot.on('document', async (msg) => {
     }
 });
 
-console.log('Bot running – Maytapi instant connect + profile verification');
+console.log('Bot running – shared API pool, 20/s checks, live progress');
