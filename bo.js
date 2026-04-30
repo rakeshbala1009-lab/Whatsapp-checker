@@ -28,62 +28,83 @@ const mainKeyboard = {
     }
 };
 
+// helper: strip non-digits
 function cleanNumber(raw) {
     return raw.replace(/\D/g, '');
 }
 
+// helper: parse Maytapi URL → product_id, phone_id, token
 function parseMaytapiUrl(url) {
+    // matches /api/{product_id}/{phone_id}/(screen|status|qrCode)?...
     const regex = /\/api\/([^\/]+)\/([^\/]+)\/(?:screen|status|qrCode)(?:\?|$)/;
     const match = url.match(regex);
     if (!match) return null;
+
     const productId = match[1];
     const phoneId = match[2];
+
+    // extract token from query string
     const urlObj = new URL(url);
     const token = urlObj.searchParams.get('token');
     if (!token) return null;
+
     return { productId, phoneId, token };
 }
 
-// --- Maytapi helpers ---
+// --- Maytapi API helpers ---
 async function getQrCode() {
     const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/screen?token=${maytapiToken}`;
     const resp = await axios.get(url, { responseType: 'arraybuffer' });
-    return resp.data;
+    return resp.data;  // PNG buffer
 }
 
 async function getRawStatus() {
     const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/status?token=${maytapiToken}`;
     const resp = await axios.get(url);
-    console.log('Maytapi status raw:', resp.data);   // <--- debug line
+    console.log('Maytapi status raw:', resp.data);
     return resp.data;
 }
 
-// Returns true if status indicates connected
+// Returns true if the status response indicates connected
 function isStatusConnected(raw) {
+    if (!raw) return false;
+    // Direct string "connected"
     if (typeof raw === 'string' && raw.toLowerCase() === 'connected') return true;
+
+    // Maytapi v2 format (your response): status.loggedIn, status.state.state='CONNECTED'
+    if (raw.status) {
+        if (raw.status.loggedIn === true) return true;
+        if (raw.status.state && raw.status.state.state === 'CONNECTED') return true;
+    }
+
+    // Maytapi v1 / other formats
     if (raw.connected === true) return true;
-    if (raw.status && raw.status.toLowerCase() === 'connected') return true;
-    if (raw.result && raw.result.status && raw.result.status.toString() === '200') return true; // some endpoints use 200
-    if (raw.user && raw.user.isConnected === true) return true;
+    if (raw.status === 'connected') return true;
+    if (raw.result && raw.result.status && raw.result.status.toString() === '200') return true;
     return false;
 }
 
 // Extract profile info: returns { name, phone } or null
 function extractProfile(raw) {
+    if (!raw) return null;
     let name = raw.name || raw.pushname || raw.senderName || '';
     let phone = raw.phone || raw.meUser || '';
-    if (!name && raw.user) {
-        name = raw.user.name || raw.user.pushname || raw.user.senderName || '';
-        phone = raw.user.phone || raw.user.number || raw.user.id || '';
+
+    // Maytapi v2 (your response with status.number)
+    if (raw.status) {
+        if (!phone) phone = raw.status.number || raw.number || '';
+        if (!name) name = raw.status.name || raw.status.pushname || raw.status.senderName || '';
     }
-    if (!phone && raw.result && raw.result.user) {
+
+    // Fallback: result.user
+    if (!name && raw.result && raw.result.user) {
         name = raw.result.user.name || raw.result.user.pushname || '';
-        phone = raw.result.user.phone || raw.result.user.number || '';
+        phone = phone || raw.result.user.phone || raw.result.user.number || '';
     }
-    // Clean phone
+
     phone = phone.replace(/@c\.us$/, '').replace(/\D/g, '');
     if (name && phone) return { name, phone };
-    if (phone) return { name: null, phone };
+    if (phone) return { name: null, phone };   // only number available
     return null;
 }
 
@@ -108,6 +129,7 @@ bot.on('message', async (msg) => {
     const text = msg.text;
     if (msg.from.id !== MASTER_ID) return;
 
+    // ── Connect button ──
     if (text === '🔗 Connect WhatsApp') {
         expectingMaytapiUrl = true;
         bot.sendMessage(chatId,
@@ -119,6 +141,7 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    // ── Send number list button ──
     if (text === '📂 Send number list') {
         if (!isConnected) {
             bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
@@ -128,6 +151,7 @@ bot.on('message', async (msg) => {
         return;
     }
 
+    // ── User sent Maytapi URL ──
     if (expectingMaytapiUrl) {
         expectingMaytapiUrl = false;
 
@@ -150,13 +174,15 @@ bot.on('message', async (msg) => {
                 const profile = extractProfile(statusRaw);
                 const confirmText = profile?.name
                     ? `✅ Already connected as *${profile.name}* (+${profile.phone})`
-                    : '✅ WhatsApp already connected.';
+                    : profile?.phone
+                        ? `✅ Already connected as +${profile.phone}`
+                        : '✅ WhatsApp already connected.';
                 bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
                 isConnected = true;
                 if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
             }
         } catch (e) {
-            console.error('Status check error:', e.message);
+            console.error('Initial status check error:', e.message);
             // continue to QR
         }
 
@@ -177,6 +203,7 @@ bot.on('message', async (msg) => {
 
             bot.sendMessage(chatId, '⏳ Waiting for you to scan the QR code...');
 
+            // Clear any existing poll
             if (statusPollInterval) clearInterval(statusPollInterval);
 
             let attempts = 0;
@@ -191,12 +218,14 @@ bot.on('message', async (msg) => {
                         const profile = extractProfile(st);
                         const confirmText = profile?.name
                             ? `✅ WhatsApp linked as *${profile.name}* (+${profile.phone})`
-                            : '✅ WhatsApp linked.';
+                            : profile?.phone
+                                ? `✅ WhatsApp linked as +${profile.phone}`
+                                : '✅ WhatsApp linked.';
                         bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
                         return;
                     }
                 } catch (err) {
-                    // keep quiet
+                    // keep polling silently
                 }
 
                 if (attempts >= 120) {
@@ -207,7 +236,7 @@ bot.on('message', async (msg) => {
             }, 5000);
 
         } catch (err) {
-            console.error('QR fetch failed:', err.response?.data || err.message);
+            console.error('QR fetch error:', err.response?.data || err.message);
             bot.sendMessage(chatId, '❌ Failed to fetch QR code. Check your Maytapi URL and ensure the phone is active.');
             maytapiProductId = null;
             maytapiPhoneId = null;
@@ -216,7 +245,7 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- File check ---
+// ── File check (unchanged) ──
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id !== MASTER_ID) return;
@@ -238,7 +267,7 @@ bot.on('document', async (msg) => {
             if (!clean) continue;
             try {
                 const res = await checkNumber(clean);
-                // adjust based on actual response; should contain success and status 200
+                // Maytapi returns: { success: true, result: { status: 200 } } when registered
                 if (res.success && res.result && res.result.status === 200) {
                     results.push(`✅ ${raw}`);
                 } else {
@@ -247,7 +276,7 @@ bot.on('document', async (msg) => {
             } catch (e) {
                 results.push(`❌ ${raw} (error)`);
             }
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 500)); // rate limit
         }
 
         const reg = results.filter(r => r.startsWith('✅'));
@@ -261,4 +290,4 @@ bot.on('document', async (msg) => {
     }
 });
 
-console.log('Bot running with robust status detection');
+console.log('Bot running – Maytapi instant connect + profile verification');
