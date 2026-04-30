@@ -32,50 +32,59 @@ function cleanNumber(raw) {
     return raw.replace(/\D/g, '');
 }
 
-// Parse Maytapi URL (e.g. .../api/{productId}/{phoneId}/screen?token=...)
 function parseMaytapiUrl(url) {
     const regex = /\/api\/([^\/]+)\/([^\/]+)\/(?:screen|status|qrCode)(?:\?|$)/;
     const match = url.match(regex);
     if (!match) return null;
-
     const productId = match[1];
     const phoneId = match[2];
-
     const urlObj = new URL(url);
     const token = urlObj.searchParams.get('token');
     if (!token) return null;
-
     return { productId, phoneId, token };
 }
 
-// --- Maytapi API helpers ---
+// --- Maytapi helpers ---
 async function getQrCode() {
     const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/screen?token=${maytapiToken}`;
     const resp = await axios.get(url, { responseType: 'arraybuffer' });
-    return resp.data;  // PNG buffer
-}
-
-async function getStatus() {
-    const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/status?token=${maytapiToken}`;
-    const resp = await axios.get(url);
     return resp.data;
 }
 
-async function getProfileInfo() {
-    // Maytapi's status endpoint already includes phone & pushname when connected
-    const status = await getStatus();
-    let name = status.name || status.pushname || status.senderName || '';
-    let phone = status.phone || status.meUser || '';
+async function getRawStatus() {
+    const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/status?token=${maytapiToken}`;
+    const resp = await axios.get(url);
+    console.log('Maytapi status raw:', resp.data);   // <--- debug line
+    return resp.data;
+}
 
-    // Clean phone number (remove @c.us etc)
-    phone = phone.replace(/@.+$/, '').replace(/\D/g, '');
-    if (name && phone) {
-        return `*${name}* (+${phone})`;
-    } else if (phone) {
-        return `+${phone}`;
-    } else {
-        return null;
+// Returns true if status indicates connected
+function isStatusConnected(raw) {
+    if (typeof raw === 'string' && raw.toLowerCase() === 'connected') return true;
+    if (raw.connected === true) return true;
+    if (raw.status && raw.status.toLowerCase() === 'connected') return true;
+    if (raw.result && raw.result.status && raw.result.status.toString() === '200') return true; // some endpoints use 200
+    if (raw.user && raw.user.isConnected === true) return true;
+    return false;
+}
+
+// Extract profile info: returns { name, phone } or null
+function extractProfile(raw) {
+    let name = raw.name || raw.pushname || raw.senderName || '';
+    let phone = raw.phone || raw.meUser || '';
+    if (!name && raw.user) {
+        name = raw.user.name || raw.user.pushname || raw.user.senderName || '';
+        phone = raw.user.phone || raw.user.number || raw.user.id || '';
     }
+    if (!phone && raw.result && raw.result.user) {
+        name = raw.result.user.name || raw.result.user.pushname || '';
+        phone = raw.result.user.phone || raw.result.user.number || '';
+    }
+    // Clean phone
+    phone = phone.replace(/@c\.us$/, '').replace(/\D/g, '');
+    if (name && phone) return { name, phone };
+    if (phone) return { name: null, phone };
+    return null;
 }
 
 async function checkNumber(phoneNumber) {
@@ -99,7 +108,6 @@ bot.on('message', async (msg) => {
     const text = msg.text;
     if (msg.from.id !== MASTER_ID) return;
 
-    // ── Connect button ──
     if (text === '🔗 Connect WhatsApp') {
         expectingMaytapiUrl = true;
         bot.sendMessage(chatId,
@@ -111,7 +119,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // ── Send number list button ──
     if (text === '📂 Send number list') {
         if (!isConnected) {
             bot.sendMessage(chatId, '⚠️ WhatsApp not linked. Tap "Connect WhatsApp" first.');
@@ -121,7 +128,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // ── User sent Maytapi URL ──
     if (expectingMaytapiUrl) {
         expectingMaytapiUrl = false;
 
@@ -135,25 +141,28 @@ bot.on('message', async (msg) => {
         maytapiPhoneId = parsed.phoneId;
         maytapiToken = parsed.token;
 
-        // ── Step 1: Check if already connected ──
+        // ---- Step 1: Check if already connected ----
+        let alreadyConnected = false;
         try {
-            const status = await getStatus();
-            if (status.connected === true || status.status === 'connected') {
+            const statusRaw = await getRawStatus();
+            if (isStatusConnected(statusRaw)) {
+                alreadyConnected = true;
+                const profile = extractProfile(statusRaw);
+                const confirmText = profile?.name
+                    ? `✅ Already connected as *${profile.name}* (+${profile.phone})`
+                    : '✅ WhatsApp already connected.';
+                bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
                 isConnected = true;
-                // Fetch name/number for verification
-                const profile = await getProfileInfo();
-                const msgText = profile 
-                    ? `✅ WhatsApp already connected as ${profile}.\nYou can now send a number list file.`
-                    : '✅ WhatsApp already connected.\nYou can now send a number list file.';
-                bot.sendMessage(chatId, msgText);
                 if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
-                return;   // DONE
             }
         } catch (e) {
-            // ignore, proceed to QR
+            console.error('Status check error:', e.message);
+            // continue to QR
         }
 
-        // ── Step 2: Not connected → fetch QR and poll ──
+        if (alreadyConnected) return;
+
+        // ---- Step 2: Not connected → fetch QR and poll ----
         bot.sendMessage(chatId, '⏳ Fetching QR code from Maytapi...');
         try {
             const qrBuffer = await getQrCode();
@@ -168,27 +177,26 @@ bot.on('message', async (msg) => {
 
             bot.sendMessage(chatId, '⏳ Waiting for you to scan the QR code...');
 
-            // Clear any existing poll
             if (statusPollInterval) clearInterval(statusPollInterval);
 
             let attempts = 0;
             statusPollInterval = setInterval(async () => {
                 attempts++;
                 try {
-                    const st = await getStatus();
-                    if (st.connected === true || st.status === 'connected') {
+                    const st = await getRawStatus();
+                    if (isStatusConnected(st)) {
                         clearInterval(statusPollInterval);
                         statusPollInterval = null;
                         isConnected = true;
-                        // Fetch name/number for verification
-                        const profile = await getProfileInfo();
-                        const msgText = profile 
-                            ? `✅ WhatsApp linked as ${profile}.\nYou can now send a number list file.`
-                            : '✅ WhatsApp linked.\nYou can now send a number list file.';
-                        bot.sendMessage(chatId, msgText);
+                        const profile = extractProfile(st);
+                        const confirmText = profile?.name
+                            ? `✅ WhatsApp linked as *${profile.name}* (+${profile.phone})`
+                            : '✅ WhatsApp linked.';
+                        bot.sendMessage(chatId, confirmText + '\nYou can now send a number list file.');
+                        return;
                     }
                 } catch (err) {
-                    // keep polling silently
+                    // keep quiet
                 }
 
                 if (attempts >= 120) {
@@ -199,7 +207,7 @@ bot.on('message', async (msg) => {
             }, 5000);
 
         } catch (err) {
-            console.error('QR fetch error:', err.response?.data || err.message);
+            console.error('QR fetch failed:', err.response?.data || err.message);
             bot.sendMessage(chatId, '❌ Failed to fetch QR code. Check your Maytapi URL and ensure the phone is active.');
             maytapiProductId = null;
             maytapiPhoneId = null;
@@ -208,7 +216,7 @@ bot.on('message', async (msg) => {
     }
 });
 
-// ── File check (unchanged) ──
+// --- File check ---
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id !== MASTER_ID) return;
@@ -230,6 +238,7 @@ bot.on('document', async (msg) => {
             if (!clean) continue;
             try {
                 const res = await checkNumber(clean);
+                // adjust based on actual response; should contain success and status 200
                 if (res.success && res.result && res.result.status === 200) {
                     results.push(`✅ ${raw}`);
                 } else {
@@ -252,4 +261,4 @@ bot.on('document', async (msg) => {
     }
 });
 
-console.log('Bot running with instant connect & profile verification');
+console.log('Bot running with robust status detection');
