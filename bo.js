@@ -12,7 +12,7 @@ let isConnected = false;
 let maytapiProductId = null;
 let maytapiPhoneId = null;
 let maytapiToken = null;
-let statusPollInterval = null;   // stores polling timer
+let statusPollInterval = null;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
@@ -28,14 +28,12 @@ const mainKeyboard = {
     }
 };
 
-// helper: strip non‑digits
 function cleanNumber(raw) {
     return raw.replace(/\D/g, '');
 }
 
-// helper: parse Maytapi URL → product_id, phone_id, token
+// Parse Maytapi URL (e.g. .../api/{productId}/{phoneId}/screen?token=...)
 function parseMaytapiUrl(url) {
-    // matches /api/{product_id}/{phone_id}/...?token={token}
     const regex = /\/api\/([^\/]+)\/([^\/]+)\/(?:screen|status|qrCode)(?:\?|$)/;
     const match = url.match(regex);
     if (!match) return null;
@@ -43,7 +41,6 @@ function parseMaytapiUrl(url) {
     const productId = match[1];
     const phoneId = match[2];
 
-    // extract token from query string
     const urlObj = new URL(url);
     const token = urlObj.searchParams.get('token');
     if (!token) return null;
@@ -51,17 +48,34 @@ function parseMaytapiUrl(url) {
     return { productId, phoneId, token };
 }
 
-// maytapi API calls
+// --- Maytapi API helpers ---
 async function getQrCode() {
     const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/screen?token=${maytapiToken}`;
     const resp = await axios.get(url, { responseType: 'arraybuffer' });
-    return resp.data;  // png buffer
+    return resp.data;  // PNG buffer
 }
 
 async function getStatus() {
     const url = `https://api.maytapi.com/api/${maytapiProductId}/${maytapiPhoneId}/status?token=${maytapiToken}`;
     const resp = await axios.get(url);
-    return resp.data;  // { connected: true/false, ... }
+    return resp.data;
+}
+
+async function getProfileInfo() {
+    // Maytapi's status endpoint already includes phone & pushname when connected
+    const status = await getStatus();
+    let name = status.name || status.pushname || status.senderName || '';
+    let phone = status.phone || status.meUser || '';
+
+    // Clean phone number (remove @c.us etc)
+    phone = phone.replace(/@.+$/, '').replace(/\D/g, '');
+    if (name && phone) {
+        return `*${name}* (+${phone})`;
+    } else if (phone) {
+        return `+${phone}`;
+    } else {
+        return null;
+    }
 }
 
 async function checkNumber(phoneNumber) {
@@ -75,7 +89,7 @@ async function checkNumber(phoneNumber) {
     return resp.data;
 }
 
-// ═══════════════ BOT HANDLERS ═══════════════
+// --- Bot handlers ---
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Welcome. Use keyboard.', mainKeyboard);
 });
@@ -121,10 +135,27 @@ bot.on('message', async (msg) => {
         maytapiPhoneId = parsed.phoneId;
         maytapiToken = parsed.token;
 
-        bot.sendMessage(chatId, '⏳ Fetching QR code from Maytapi...');
-
+        // ── Step 1: Check if already connected ──
         try {
-            // Fetch QR code image
+            const status = await getStatus();
+            if (status.connected === true || status.status === 'connected') {
+                isConnected = true;
+                // Fetch name/number for verification
+                const profile = await getProfileInfo();
+                const msgText = profile 
+                    ? `✅ WhatsApp already connected as ${profile}.\nYou can now send a number list file.`
+                    : '✅ WhatsApp already connected.\nYou can now send a number list file.';
+                bot.sendMessage(chatId, msgText);
+                if (statusPollInterval) { clearInterval(statusPollInterval); statusPollInterval = null; }
+                return;   // DONE
+            }
+        } catch (e) {
+            // ignore, proceed to QR
+        }
+
+        // ── Step 2: Not connected → fetch QR and poll ──
+        bot.sendMessage(chatId, '⏳ Fetching QR code from Maytapi...');
+        try {
             const qrBuffer = await getQrCode();
             const imgPath = `./qr_${Date.now()}.png`;
             fs.writeFileSync(imgPath, qrBuffer);
@@ -135,7 +166,6 @@ bot.on('message', async (msg) => {
             });
             fs.unlinkSync(imgPath);
 
-            // Start polling status
             bot.sendMessage(chatId, '⏳ Waiting for you to scan the QR code...');
 
             // Clear any existing poll
@@ -145,27 +175,28 @@ bot.on('message', async (msg) => {
             statusPollInterval = setInterval(async () => {
                 attempts++;
                 try {
-                    const status = await getStatus();
-                    console.log('Status check:', status);
-
-                    // Maytapi returns { connected: true } when ready
-                    if (status.connected === true || status.status === 'connected' || status === 'connected') {
+                    const st = await getStatus();
+                    if (st.connected === true || st.status === 'connected') {
                         clearInterval(statusPollInterval);
                         statusPollInterval = null;
                         isConnected = true;
-                        bot.sendMessage(chatId, '✅ WhatsApp linked via Maytapi! You can now send a number list file.');
+                        // Fetch name/number for verification
+                        const profile = await getProfileInfo();
+                        const msgText = profile 
+                            ? `✅ WhatsApp linked as ${profile}.\nYou can now send a number list file.`
+                            : '✅ WhatsApp linked.\nYou can now send a number list file.';
+                        bot.sendMessage(chatId, msgText);
                     }
                 } catch (err) {
-                    console.error('Status poll error:', err.message);
+                    // keep polling silently
                 }
 
-                // Timeout after 120 attempts (10 minutes)
                 if (attempts >= 120) {
                     clearInterval(statusPollInterval);
                     statusPollInterval = null;
                     bot.sendMessage(chatId, '❌ Linking timed out (10 min). Tap "Connect WhatsApp" to try again.');
                 }
-            }, 5000);   // poll every 5 seconds
+            }, 5000);
 
         } catch (err) {
             console.error('QR fetch error:', err.response?.data || err.message);
@@ -177,7 +208,7 @@ bot.on('message', async (msg) => {
     }
 });
 
-// ═══════════════ FILE CHECK ═══════════════
+// ── File check (unchanged) ──
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id !== MASTER_ID) return;
@@ -199,7 +230,6 @@ bot.on('document', async (msg) => {
             if (!clean) continue;
             try {
                 const res = await checkNumber(clean);
-                // res.result.status === 200 → registered
                 if (res.success && res.result && res.result.status === 200) {
                     results.push(`✅ ${raw}`);
                 } else {
@@ -208,7 +238,7 @@ bot.on('document', async (msg) => {
             } catch (e) {
                 results.push(`❌ ${raw} (error)`);
             }
-            await new Promise(r => setTimeout(r, 500)); // light rate‑limit
+            await new Promise(r => setTimeout(r, 500));
         }
 
         const reg = results.filter(r => r.startsWith('✅'));
@@ -222,4 +252,4 @@ bot.on('document', async (msg) => {
     }
 });
 
-console.log('Bot running – user provides Maytapi URL.');
+console.log('Bot running with instant connect & profile verification');
